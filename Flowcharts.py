@@ -3,6 +3,9 @@ import re
 import graphviz
 import textwrap
 
+# Ensure Graphviz executables are on PATH
+os.environ["PATH"] += os.pathsep + r"C:\Program Files\Graphviz\bin"
+
 
 # ==========================================================
 # Utility Functions
@@ -24,10 +27,13 @@ def wrap_label(text, width=None):
     if width is None:
         width = LABEL_WRAP_WIDTH
         
-    # Escape backslashes so Graphviz prints \n literally instead of breaking the line
     escaped_text = text.replace('\\', '\\\\')
+    lines = escaped_text.split('\n')
+    wrapped_lines = []
+    for line in lines:
+        wrapped_lines.extend(textwrap.wrap(line, width))
     
-    return "\n".join(textwrap.wrap(escaped_text, width))
+    return "\n".join(wrapped_lines)
 
 
 def tf_label(text):
@@ -57,10 +63,18 @@ def extract_c_functions(filename):
         r'\b[a-zA-Z_][a-zA-Z0-9_\*\s]*\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)\s*\{'
     )
 
+    c_keywords = {
+        'if', 'else', 'while', 'for', 'do', 'switch', 'case',
+        'return', 'break', 'continue', 'goto', 'sizeof', 'typedef',
+        'struct', 'union', 'enum', 'default'
+    }
+
     functions = []
 
     for match in pattern.finditer(code):
         name = match.group(1)
+        if name in c_keywords:
+            continue
         start = match.end() - 1
         end = find_matching(code, start, "{", "}")
         if end != -1:
@@ -251,7 +265,15 @@ def parse_block(code):
 
         i = semi + 1
 
-    return nodes
+    # Optimize consecutive identical normal or io statement block into one
+    optimized_nodes = []
+    for node in nodes:
+        if optimized_nodes and optimized_nodes[-1]["type"] == node["type"] and node["type"] in ["stmt", "io"]:
+            optimized_nodes[-1]["text"] += "\n" + node["text"]
+        else:
+            optimized_nodes.append(node)
+
+    return optimized_nodes
 
 
 # ==========================================================
@@ -276,12 +298,21 @@ def build_graph(nodes, dot, parent, entry_label=None):
             
             dot.node(node_id, wrap_label(node["text"]), shape=shape)
             
-            if current_label:
-                dot.edge(parent, node_id, label=current_label)
-            else:
-                dot.edge(parent, node_id)
+            if parent is not None:
+                if current_label:
+                    dot.edge(parent, node_id, label=current_label)
+                else:
+                    dot.edge(parent, node_id)
 
             parent = node_id
+
+            # Parse lines to check for control flow breaks (return/break/continue)
+            lines = [line.strip() for line in node["text"].split('\n')]
+            last_stmt = lines[-1] if lines else ""
+            if last_stmt.startswith('return') or last_stmt.startswith('break') or last_stmt.startswith('continue'):
+                if last_stmt.startswith('return'):
+                    dot.edge(node_id, "END")
+                parent = None
 
         # =====================================================
         # IF STATEMENT
@@ -290,10 +321,11 @@ def build_graph(nodes, dot, parent, entry_label=None):
             cond_id = str(id(node))
             dot.node(cond_id, wrap_label(node["cond"]), shape=DIAMOND_SHAPE)
             
-            if current_label:
-                dot.edge(parent, cond_id, label=current_label)
-            else:
-                dot.edge(parent, cond_id)
+            if parent is not None:
+                if current_label:
+                    dot.edge(parent, cond_id, label=current_label)
+                else:
+                    dot.edge(parent, cond_id)
 
             merge_id = cond_id + "_merge"
             dot.node(merge_id, "", shape="point")
@@ -301,14 +333,16 @@ def build_graph(nodes, dot, parent, entry_label=None):
             # ---- TRUE branch ----
             if node["body"]:
                 true_end = build_graph(node["body"], dot, cond_id, entry_label=tf_label("True"))
-                dot.edge(true_end, merge_id)
+                if true_end is not None:
+                    dot.edge(true_end, merge_id)
             else:
                 dot.edge(cond_id, merge_id, label=tf_label("True"))
 
             # ---- FALSE branch (Handles 'else' blocks) ----
             if "else_body" in node and node["else_body"]:
                 false_end = build_graph(node["else_body"], dot, cond_id, entry_label=tf_label("False"))
-                dot.edge(false_end, merge_id)
+                if false_end is not None:
+                    dot.edge(false_end, merge_id)
             else:
                 dot.edge(cond_id, merge_id, label=tf_label("False"))
 
@@ -321,16 +355,18 @@ def build_graph(nodes, dot, parent, entry_label=None):
             cond_id = str(id(node))
             dot.node(cond_id, wrap_label(node["cond"]), shape=DIAMOND_SHAPE)
             
-            if current_label:
-                dot.edge(parent, cond_id, label=current_label)
-            else:
-                dot.edge(parent, cond_id)
+            if parent is not None:
+                if current_label:
+                    dot.edge(parent, cond_id, label=current_label)
+                else:
+                    dot.edge(parent, cond_id)
 
             # TRUE branch → body
             if node["body"]:
                 body_end = build_graph(node["body"], dot, cond_id, entry_label=tf_label("True"))
                 # loop back
-                dot.edge(body_end, cond_id)
+                if body_end is not None:
+                    dot.edge(body_end, cond_id)
             else:
                 dot.edge(cond_id, cond_id, label=tf_label("True"))
 
@@ -350,10 +386,11 @@ def build_graph(nodes, dot, parent, entry_label=None):
             init_id = str(id(node)) + "_init"
             dot.node(init_id, wrap_label(node["init"]), shape=BOX_SHAPE)
             
-            if current_label:
-                dot.edge(parent, init_id, label=current_label)
-            else:
-                dot.edge(parent, init_id)
+            if parent is not None:
+                if current_label:
+                    dot.edge(parent, init_id, label=current_label)
+                else:
+                    dot.edge(parent, init_id)
 
             # CONDITION
             cond_id = str(id(node)) + "_cond"
@@ -370,7 +407,8 @@ def build_graph(nodes, dot, parent, entry_label=None):
             inc_id = str(id(node)) + "_inc"
             dot.node(inc_id, wrap_label(node["inc"]), shape=BOX_SHAPE)
 
-            dot.edge(body_end, inc_id)
+            if body_end is not None:
+                dot.edge(body_end, inc_id)
             dot.edge(inc_id, cond_id)
 
             # FALSE branch → exit
@@ -417,7 +455,8 @@ def generate_flowchart(func):
 
     parsed = parse_block(func["body"])
     last = build_graph(parsed, dot, "START")
-    dot.edge(last, "END")
+    if last is not None:
+        dot.edge(last, "END")
 
     filename = f"Flowchart_{func['name']}"
     output = dot.render(filename, cleanup=True)
@@ -461,6 +500,37 @@ TF_LABEL_BOLD = True
 
 
 # ==========================================================
+# Selection Parser
+# ==========================================================
+
+def parse_selection(raw, count):
+    """Parse user input into a list of 0-based indices.
+    Supports: * (all), comma-separated (1,3,5), ranges (2-4), or a mix (1,3-5).
+    """
+    if raw.strip() == "*":
+        return list(range(count))
+
+    indices = []
+    for part in raw.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            start, end = int(start.strip()), int(end.strip())
+            indices.extend(range(start - 1, end))  # convert to 0-based
+        else:
+            indices.append(int(part) - 1)
+
+    # Filter to valid range and deduplicate while preserving order
+    seen = set()
+    valid = []
+    for idx in indices:
+        if 0 <= idx < count and idx not in seen:
+            seen.add(idx)
+            valid.append(idx)
+    return valid
+
+
+# ==========================================================
 # MAIN
 # ==========================================================
 
@@ -476,12 +546,23 @@ def main():
     for file in c_files:
         functions.extend(extract_c_functions(file))
 
+    if not functions:
+        print("No functions found in C files.")
+        return
+
     print("\nAvailable Functions:")
     for i, f in enumerate(functions):
         print(f"[{i+1}] {f['name']} ({f['file']})")
 
-    choice = int(input("Select function: ")) - 1
-    generate_flowchart(functions[choice])
+    raw = input("\nSelect functions (e.g. 1,3,5 or 1-4 or *): ").strip()
+    selected = parse_selection(raw, len(functions))
+
+    if not selected:
+        print("No valid selection.")
+        return
+
+    for idx in selected:
+        generate_flowchart(functions[idx])
 
 
 if __name__ == "__main__":
